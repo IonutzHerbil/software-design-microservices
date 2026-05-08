@@ -59,4 +59,13 @@ app.get('/movies', async (req, res) => {
   }
 });
 
+app.get('/health', (_req, res) => {
+  const state = breaker.opened ? 'open' : breaker.halfOpen ? 'half-open' : 'closed';
+  res.json({
+    service: 'movie-service',
+    status: 'ok',
+    circuitBreaker: { state },
+  });
+});
+
 app.listen(PORT, () => console.log(`Movie Service running on port ${PORT}`));
