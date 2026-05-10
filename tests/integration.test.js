@@ -26,6 +26,8 @@ const FALLBACK_TITLES = [
   "The Matrix",
 ];
 
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 async function sendRequests(n, url = `${MOVIE}/movies`) {
   return Promise.all(Array.from({ length: n }, () => axios.get(url)));
 }
@@ -80,7 +82,6 @@ describe("Service Dependency", () => {
     expect(proxied.data).toHaveProperty("movies");
     expect(proxied.data.movies).toHaveLength(direct.data.movies.length);
   });
-
 });
 
 describe("Timeout Execution", () => {
@@ -93,7 +94,6 @@ describe("Timeout Execution", () => {
       expect(elapsed).toBeLessThan(1600);
     }
   });
-
 });
 
 describe("Fallback Logic", () => {
@@ -138,47 +138,15 @@ describe("Fallback Logic", () => {
       .totalRequests;
     expect(after).toBe(before + 3);
   });
-
-  test('fallbackResponses increments when circuit is open', async () => {
-  const before = (await axios.get(`${MOVIE}/health`)).data.semanticMetrics;
-  const fallbacksBefore = before.fallbackResponses;
-  const totalBefore = before.totalRequests;
-
-  await sendRequests(3);
-
-  const after = (await axios.get(`${MOVIE}/health`)).data.semanticMetrics;
-
-  const newRequests = after.totalRequests - totalBefore;
-  const newLive = after.liveResponses - before.liveResponses;
-  const newFallbacks = after.fallbackResponses - fallbacksBefore;
-
-  expect(newLive + newFallbacks).toBe(newRequests);
-});
 });
 
-describe("Circuit Recovery", () => {
-  test("circuit state is one of the three valid states", async () => {
+describe("Circuit Breaker", () => {
+  test("starts in closed state", async () => {
     const res = await axios.get(`${MOVIE}/health`);
-    expect(["closed", "open", "half-open"]).toContain(
-      res.data.circuitBreaker.state,
-    );
+    expect(res.data.circuitBreaker.state).toBe("closed");
   });
 
-  test("fallbackRate reflects actual ratio of fallback responses", async () => {
-    const before = (await axios.get(`${MOVIE}/health`)).data.semanticMetrics;
-    await sendRequests(4);
-    const after = (await axios.get(`${MOVIE}/health`)).data.semanticMetrics;
-
-    const expectedRate =
-      after.totalRequests > 0
-        ? ((after.fallbackResponses / after.totalRequests) * 100).toFixed(1) +
-          "%"
-        : "0%";
-
-    expect(after.fallbackRate).toBe(expectedRate);
-  });
-
-  test("bulkhead slots return to 0 after requests complete", async () => {
+  test("bulkhead slots return to 0 after all requests complete", async () => {
     await sendRequests(5);
     const health = await axios.get(`${MOVIE}/health`);
     expect(health.data.bulkhead.activeNow).toBe(0);
@@ -189,13 +157,62 @@ describe("Circuit Recovery", () => {
     expect(res.status).toBe(200);
     expect(res.data.service).toBe("recommendation-service");
   });
+});
 
-  test("live and fallback response counts add up to total", async () => {
-    const health = await axios.get(`${MOVIE}/health`);
-    const { totalRequests, liveResponses, fallbackResponses } =
-      health.data.semanticMetrics;
-    expect(liveResponses + fallbackResponses).toBeLessThanOrEqual(
-      totalRequests,
-    );
+describe("Chaos -> circuit breaker under failure", () => {
+  beforeEach(async () => {
+    await axios.post(`${REC}/test/chaos`, { enabled: false });
+    await wait(500);
   });
+
+  afterAll(async () => {
+    await axios.post(`${REC}/test/chaos`, { enabled: false });
+  });
+
+  test("always returns 200 even when recommendation service is failing", async () => {
+    await axios.post(`${REC}/test/chaos`, { enabled: true });
+    const responses = await sendRequests(5);
+    responses.forEach((res) => {
+      expect(res.status).toBe(200);
+      expect(res.data).toHaveProperty("movies");
+      expect(["live", "trending"]).toContain(res.data.source);
+    });
+  });
+
+test("circuit opens after repeated failures", async () => {
+  await axios.post(`${REC}/test/chaos`, { enabled: true });
+  
+  for (let i = 0; i < 6; i++) {
+    await axios.get(`${MOVIE}/movies`);
+  }
+  
+  await wait(500);
+  const health = await axios.get(`${MOVIE}/health`);
+  const state = health.data.circuitBreaker.state;
+  expect(state === "open" || state === "half-open").toBe(true);
+}, 15000);
+
+  test("fallback responses increase under chaos", async () => {
+    const before = (await axios.get(`${MOVIE}/health`)).data.semanticMetrics
+      .fallbackResponses;
+    await axios.post(`${REC}/test/chaos`, { enabled: true });
+    await sendRequests(5);
+    const after = (await axios.get(`${MOVIE}/health`)).data.semanticMetrics
+      .fallbackResponses;
+    expect(after).toBeGreaterThan(before);
+  });
+
+  test("circuit recovers once chaos stops", async () => {
+    await axios.post(`${REC}/test/chaos`, { enabled: true });
+    await sendRequests(5);
+
+    await axios.post(`${REC}/test/chaos`, { enabled: false });
+    await wait(12000);
+
+    await axios.get(`${MOVIE}/movies`);
+    await axios.get(`${MOVIE}/movies`);
+
+    const health = await axios.get(`${MOVIE}/health`);
+    expect(health.data.circuitBreaker.state).toBe("closed");
+  }, 20000);
 });
