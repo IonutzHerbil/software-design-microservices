@@ -103,6 +103,9 @@ const metrics = {
   startedAt: new Date().toISOString(),
 };
 
+const latencyBuckets = [];
+const MAX_LATENCY_SAMPLES = 50;
+
 async function fetchRecommendations(requestId) {
   if (activeRequests >= BULKHEAD_SIZE) {
     metrics.bulkheadRejections++;
@@ -117,11 +120,18 @@ async function fetchRecommendations(requestId) {
     `[Rec. Call][${requestId}] Starting -> active slots: ${activeRequests}/${BULKHEAD_SIZE}`,
   );
 
+  const start = Date.now();
+
   try {
     const response = await axios.get(RECOMMENDATION_SERVICE_URL, {
       timeout: 1500,
       headers: { "x-request-id": requestId },
     });
+
+    const latency = Date.now() - start;
+    latencyBuckets.push(latency);
+    if (latencyBuckets.length > MAX_LATENCY_SAMPLES) latencyBuckets.shift();
+
     const ids = response.data.recommended_ids;
     const movies = ids.map(
       (id) =>
@@ -150,11 +160,20 @@ breaker.fallback(() => ({ source: "trending", movies: FALLBACK_MOVIES }));
 breaker.on("open", () => console.warn("[CB] OPEN -> serving fallback"));
 breaker.on("halfOpen", () => console.info("[CB] HALF-OPEN -> probing service"));
 breaker.on("close", () => console.info("[CB] CLOSED -> service recovered"));
-breaker.on("fallback", () =>
-  console.warn("[CB] Fallback -> returning trending movies"),
-);
-breaker.on("timeout", () => console.warn("[CB] Timeout -> exceeded 1500ms"));
-breaker.on("reject", () => console.warn("[CB] Rejected -> circuit is open"));
+breaker.on("fallback", (result, err) => {
+  if (err?.message !== "Bulkhead full") {
+    metrics.fallbackResponses++;
+  }
+  console.warn("[CB] Fallback -> returning trending movies");
+});
+breaker.on("timeout", () => {
+  metrics.timeouts++;
+  console.warn("[CB] Timeout -> exceeded 1500ms");
+});
+breaker.on("reject", () => {
+  metrics.circuitRejections++;
+  console.warn("[CB] Rejected -> circuit is open");
+});
 app.use((req, _res, next) => {
   req.requestId =
     req.headers["x-request-id"] ||
@@ -164,7 +183,7 @@ app.use((req, _res, next) => {
 
 app.get("/movies", async (req, res) => {
   metrics.totalRequests++;
-  const requestId = req.requestId
+  const requestId = req.requestId;
 
   try {
     const result = await breaker.fire(requestId);
@@ -191,11 +210,25 @@ app.get("/health", (_req, res) => {
         "%"
       : "0%";
 
+  const avgLatency =
+    latencyBuckets.length > 0
+      ? Math.round(
+          latencyBuckets.reduce((a, b) => a + b, 0) / latencyBuckets.length,
+        )
+      : 0;
+  const maxLatency =
+    latencyBuckets.length > 0 ? Math.max(...latencyBuckets) : 0;
+
   res.json({
     service: "movie-service",
     status: "ok",
     circuitBreaker: { state, config: breakerOptions, stats: breaker.stats },
     bulkhead: { maxConcurrent: BULKHEAD_SIZE, activeNow: activeRequests },
+    latency: {
+      avgMs: avgLatency,
+      maxMs: maxLatency,
+      samples: latencyBuckets.length,
+    },
     semanticMetrics: { ...metrics, fallbackRate },
   });
 });
