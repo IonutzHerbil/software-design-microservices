@@ -1,13 +1,13 @@
 @echo off
 echo Starting Microservices...
 
-start "Recommendation Service" cmd /k "node recommendation.js"
+start "Recommendation Service" cmd /k "node ..\services\recommendation.js"
 timeout /t 1 /nobreak > nul
 
-start "Movie Service" cmd /k "node movie.js"
+start "Movie Service" cmd /k "node ..\services\movie.js"
 timeout /t 1 /nobreak > nul
 
-start "API Gateway" cmd /k "node gateway.js"
+start "API Gateway" cmd /k "node ..\services\gateway.js"
 
 echo All services started.
 echo  Gateway:  http://localhost:3000
