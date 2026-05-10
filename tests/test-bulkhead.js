@@ -1,6 +1,6 @@
 const http = require("http");
 
-function makeRequest() {S
+function makeRequest() {
   return new Promise((resolve) => {
     http.get("http://localhost:3001/movies", (res) => {
       let data = "";
