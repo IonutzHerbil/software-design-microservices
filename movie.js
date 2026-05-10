@@ -90,20 +90,51 @@ const FALLBACK_MOVIES = [
   },
 ];
 
-async function fetchRecommendations() {
-  const response = await axios.get(RECOMMENDATION_SERVICE_URL, {
-    timeout: 1500,
-  });
-  const ids = response.data.recommended_ids;
-  const movies = ids.map(
-    (id) =>
-      MOVIE_DB[id] || {
-        id,
-        title: `Movie ${id}`,
-        description: "No description available.",
-      },
+const BULKHEAD_SIZE = 3;
+let activeRequests = 0;
+
+const metrics = {
+  totalRequests: 0,
+  liveResponses: 0,
+  fallbackResponses: 0,
+  bulkheadRejections: 0,
+  timeouts: 0,
+  circuitRejections: 0,
+  startedAt: new Date().toISOString(),
+};
+
+async function fetchRecommendations(requestId) {
+  if (activeRequests >= BULKHEAD_SIZE) {
+    metrics.bulkheadRejections++;
+    console.warn(
+      `[Bulkhead][${requestId}] Rejected -> ${activeRequests}/${BULKHEAD_SIZE} slots occupied`,
+    );
+    throw new Error("Bulkhead full");
+  }
+
+  activeRequests++;
+  console.log(
+    `[Rec. Call][${requestId}] Starting -> active slots: ${activeRequests}/${BULKHEAD_SIZE}`,
   );
-  return { source: "live", movies };
+
+  try {
+    const response = await axios.get(RECOMMENDATION_SERVICE_URL, {
+      timeout: 1500,
+      headers: { "x-request-id": requestId },
+    });
+    const ids = response.data.recommended_ids;
+    const movies = ids.map(
+      (id) =>
+        MOVIE_DB[id] || {
+          id,
+          title: `Movie ${id}`,
+          description: "No description available.",
+        },
+    );
+    return { source: "live", movies };
+  } finally {
+    activeRequests--;
+  }
 }
 
 const breakerOptions = {
@@ -124,13 +155,26 @@ breaker.on("fallback", () =>
 );
 breaker.on("timeout", () => console.warn("[CB] Timeout -> exceeded 1500ms"));
 breaker.on("reject", () => console.warn("[CB] Rejected -> circuit is open"));
+app.use((req, _res, next) => {
+  req.requestId =
+    req.headers["x-request-id"] ||
+    `ms-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  next();
+});
 
 app.get("/movies", async (req, res) => {
+  metrics.totalRequests++;
+  const requestId = req.requestId
+
   try {
-    const result = await breaker.fire();
+    const result = await breaker.fire(requestId);
+    if (result.source === "live") metrics.liveResponses++;
+    res.setHeader("x-request-id", requestId);
     res.json(result);
   } catch (err) {
-    console.error("[Movie Service] Uncaught:", err.message);
+    console.error(`[Movie Service][${requestId}] Uncaught:`, err.message);
+    metrics.fallbackResponses++;
+    res.setHeader("x-request-id", requestId);
     res.json({ source: "trending", movies: FALLBACK_MOVIES });
   }
 });
@@ -141,10 +185,18 @@ app.get("/health", (_req, res) => {
     : breaker.halfOpen
       ? "half-open"
       : "closed";
+  const fallbackRate =
+    metrics.totalRequests > 0
+      ? ((metrics.fallbackResponses / metrics.totalRequests) * 100).toFixed(1) +
+        "%"
+      : "0%";
+
   res.json({
     service: "movie-service",
     status: "ok",
-    circuitBreaker: { state },
+    circuitBreaker: { state, config: breakerOptions, stats: breaker.stats },
+    bulkhead: { maxConcurrent: BULKHEAD_SIZE, activeNow: activeRequests },
+    semanticMetrics: { ...metrics, fallbackRate },
   });
 });
 
