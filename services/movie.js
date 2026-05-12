@@ -4,8 +4,7 @@ const circuitBreaker = require("opossum");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const RECOMMENDATION_SERVICE_URL = "http://localhost:3002/recommendations";
-
+const RECOMMENDATION_SERVICE_URL = process.env.RECOMMENDATION_SERVICE_URL || 'http://localhost:3002/recommendations';
 const MOVIE_DB = {
   101: {
     id: 101,

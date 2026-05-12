@@ -1,0 +1,30 @@
+services:
+  recommendation:
+    build: .
+    command: node services/recommendation.js
+    ports:
+      - "3002:3002"
+    environment:
+      - PORT=3002
+
+  movie:
+    build: .
+    command: node services/movie.js
+    ports:
+      - "3001:3001"
+    environment:
+      - PORT=3001
+      - RECOMMENDATION_SERVICE_URL=http://recommendation:3002/recommendations
+    depends_on:
+      - recommendation
+
+  gateway:
+    build: .
+    command: node services/gateway.js
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - MOVIE_SERVICE_URL=http://movie:3001
+    depends_on:
+      - movie
