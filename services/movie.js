@@ -1,10 +1,12 @@
 const express = require("express");
 const axios = require("axios");
-const circuitBreaker = require("opossum");
+const CircuitBreaker = require("../utils/CircuitBreaker");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const RECOMMENDATION_SERVICE_URL = process.env.RECOMMENDATION_SERVICE_URL || 'http://localhost:3002/recommendations';
+const RECOMMENDATION_SERVICE_URL =
+  process.env.RECOMMENDATION_SERVICE_URL ||
+  "http://localhost:3002/recommendations";
 const MOVIE_DB = {
   101: {
     id: 101,
@@ -145,34 +147,13 @@ async function fetchRecommendations(requestId) {
     activeRequests--;
   }
 }
-
-const breakerOptions = {
+const breaker = new CircuitBreaker(fetchRecommendations, {
   timeout: 1500,
-  errorThresholdPercentage: 50,
+  errorThreshold: 50,
   resetTimeout: 10000,
   volumeThreshold: 2,
-};
-
-const breaker = new circuitBreaker(fetchRecommendations, breakerOptions);
+});
 breaker.fallback(() => ({ source: "trending", movies: FALLBACK_MOVIES }));
-
-breaker.on("open", () => console.warn("[CB] OPEN -> serving fallback"));
-breaker.on("halfOpen", () => console.info("[CB] HALF-OPEN -> probing service"));
-breaker.on("close", () => console.info("[CB] CLOSED -> service recovered"));
-breaker.on("fallback", (result, err) => {
-  if (err?.message !== "Bulkhead full") {
-    metrics.fallbackResponses++;
-  }
-  console.warn("[CB] Fallback -> returning trending movies");
-});
-breaker.on("timeout", () => {
-  metrics.timeouts++;
-  console.warn("[CB] Timeout -> exceeded 1500ms");
-});
-breaker.on("reject", () => {
-  metrics.circuitRejections++;
-  console.warn("[CB] Rejected -> circuit is open");
-});
 app.use((req, _res, next) => {
   req.requestId =
     req.headers["x-request-id"] ||
@@ -182,11 +163,15 @@ app.use((req, _res, next) => {
 
 app.get("/movies", async (req, res) => {
   metrics.totalRequests++;
-  const requestId = req.requestId;
+  const { requestId } = req;
 
   try {
     const result = await breaker.fire(requestId);
-    if (result.source === "live") metrics.liveResponses++;
+    if (result.source === "live") {
+      metrics.liveResponses++;
+    } else {
+      metrics.fallbackResponses++;
+    }
     res.setHeader("x-request-id", requestId);
     res.json(result);
   } catch (err) {
@@ -196,7 +181,6 @@ app.get("/movies", async (req, res) => {
     res.json({ source: "trending", movies: FALLBACK_MOVIES });
   }
 });
-
 app.get("/health", (_req, res) => {
   const state = breaker.opened
     ? "open"
@@ -221,7 +205,16 @@ app.get("/health", (_req, res) => {
   res.json({
     service: "movie-service",
     status: "ok",
-    circuitBreaker: { state, config: breakerOptions, stats: breaker.stats },
+    circuitBreaker: {
+      state,
+      config: {
+        timeout: 1500,
+        errorThreshold: 50,
+        resetTimeout: 10000,
+        volumeThreshold: 2,
+      },
+      stats: breaker.stats,
+    },
     bulkhead: { maxConcurrent: BULKHEAD_SIZE, activeNow: activeRequests },
     latency: {
       avgMs: avgLatency,
